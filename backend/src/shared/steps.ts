@@ -1,0 +1,200 @@
+import type { Citation, GeneratedStep, RetrievedPassage } from './types';
+
+/** Round-3 system prompt — copied verbatim from prototype generator.py `_SYSTEM`. */
+export const SYSTEM_PROMPT =
+  'You break a daily-living task into simple, ordered steps for a person with ' +
+  'cognitive challenges. Use ONLY the provided sources. Each step must describe ' +
+  'exactly one action, in one short sentence, using plain everyday words with no ' +
+  'medical or technical jargon. Use as many steps as needed — do not merge ' +
+  'actions to shorten the list. ' +
+  'Preserve every essential detail from the sources: exact amounts, temperatures, ' +
+  "times, and conditions (for example '74°C', 'within 2 hours', 'warm, not hot, water'). " +
+  'Include every safety warning or precaution from the sources as its own step. ' +
+  'Completeness and safety come before brevity. ' +
+  'Respond with JSON only, no prose.';
+
+/** Build the user prompt — verbatim shape from prototype generator.py `_build_prompt`. */
+export function buildStepsPrompt(taskName: string, passages: RetrievedPassage[]): string {
+  const sources = passages.map((p) => `[${p.chunkId}] ${p.text}`).join('\n');
+  return (
+    `Task: ${taskName}\n\n` +
+    `Sources:\n${sources}\n\n` +
+    'Return JSON shaped exactly as: ' +
+    '{"steps": [{"text": "<one simple action, one short sentence, no jargon>", ' +
+    '"citations": ["<chunk_id used>"]}]}'
+  );
+}
+
+interface RawSteps {
+  steps: { text: string; citations: string[] }[];
+}
+
+/** Strip a ```/```json code fence (if present) and return the trimmed inner text. */
+function stripJsonFences(raw: string): string {
+  let text = raw.trim();
+  if (text.startsWith('```')) {
+    text = text.replace(/^```/, '').replace(/```$/, '').trim();
+    if (text.toLowerCase().startsWith('json')) {
+      text = text.slice(4).trim();
+    }
+  }
+  return text;
+}
+
+/** Parse + shape-validate the model output. Strips ``` fences like the prototype. */
+export function parseSteps(raw: string): RawSteps {
+  const text = stripJsonFences(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`could not parse steps from model output: ${(err as Error).message}`);
+  }
+  if (!isRawSteps(parsed)) {
+    throw new Error('could not parse steps from model output: shape mismatch');
+  }
+  return parsed;
+}
+
+function isRawSteps(value: unknown): value is RawSteps {
+  if (typeof value !== 'object' || value === null) return false;
+  const steps = (value as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return false;
+  return steps.every(
+    (s) =>
+      typeof s === 'object' &&
+      s !== null &&
+      typeof (s as { text?: unknown }).text === 'string' &&
+      Array.isArray((s as { citations?: unknown }).citations) &&
+      (s as { citations: unknown[] }).citations.every((c) => typeof c === 'string'),
+  );
+}
+
+/** Resolve a step's chunk_id citations to full Citations; drop ids not in the retrieved set. */
+export function resolveCitations(chunkIds: string[], passages: RetrievedPassage[]): Citation[] {
+  const byId = new Map(passages.map((p) => [p.chunkId, p]));
+  const resolved: Citation[] = [];
+  for (const id of chunkIds) {
+    const p = byId.get(id);
+    if (!p) continue;
+    resolved.push({ chunkId: p.chunkId, title: p.title, url: p.url, snippet: p.text });
+  }
+  return resolved;
+}
+
+/** Convenience: map raw parsed steps + retrieved passages into resolved GeneratedSteps. */
+export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): GeneratedStep[] {
+  return raw.steps.map((s) => ({ text: s.text, citations: resolveCitations(s.citations, passages) }));
+}
+
+/** Hard ceiling on generated steps when the caller does not request an exact count. */
+export const MAX_AI_TASK_STEPS = 20;
+
+/**
+ * Build the sentence that tells the model how many steps to return.
+ *  - stepCount supplied → "return exactly N steps".
+ *  - omitted            → "return no more than MAX steps" (the AI picks the count).
+ */
+export function stepCountInstruction(stepCount?: number): string {
+  return stepCount != null
+    ? `Return exactly ${stepCount} step${stepCount === 1 ? '' : 's'}.`
+    : `Return no more than ${MAX_AI_TASK_STEPS} steps.`;
+}
+
+/**
+ * Like buildStepsPrompt, but also asks the model for a short, clean task title.
+ * Used by createAiTask (one-shot generate + preview). Verbatim step style as the
+ * untitled prompt; only the requested JSON shape gains a `title`. `stepCount`, when
+ * supplied, instructs the model to return exactly that many steps.
+ */
+export function buildTitledStepsPrompt(
+  query: string,
+  passages: RetrievedPassage[],
+  stepCount?: number,
+): string {
+  const sources = passages.map((p) => `[${p.chunkId}] ${p.text}`).join('\n');
+  return (
+    `Task: ${query}\n\n` +
+    `Sources:\n${sources}\n\n` +
+    'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    `${stepCountInstruction(stepCount)}\n` +
+    'Return JSON shaped exactly as: ' +
+    '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
+    'one short sentence, no jargon>", "citations": ["<chunk_id used>"]}]}'
+  );
+}
+
+/**
+ * Ungrounded system prompt — the fallback path when no corpus passage clears the
+ * relevance threshold. Identical to SYSTEM_PROMPT but WITHOUT "Use ONLY the provided
+ * sources" (there are none): the model generates from general knowledge. Every safety
+ * instruction is kept; the result is flagged `grounded: false` for the caller.
+ */
+export const UNGROUNDED_SYSTEM_PROMPT =
+  'You break a daily-living task into simple, ordered steps for a person with ' +
+  'cognitive challenges. Each step must describe exactly one action, in one short ' +
+  'sentence, using plain everyday words with no medical or technical jargon. Use as ' +
+  'many steps as needed — do not merge actions to shorten the list. ' +
+  'Include every safety warning or precaution as its own step. ' +
+  'Completeness and safety come before brevity. ' +
+  'Respond with JSON only, no prose.';
+
+/** Like buildTitledStepsPrompt but with no Sources block — used by the ungrounded fallback. */
+export function buildUngroundedTitledStepsPrompt(query: string, stepCount?: number): string {
+  return (
+    `Task: ${query}\n\n` +
+    'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    `${stepCountInstruction(stepCount)}\n` +
+    'Return JSON shaped exactly as: ' +
+    '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
+    'one short sentence, no jargon>"}]}'
+  );
+}
+
+interface RawUngroundedTitledSteps {
+  title: string;
+  steps: { text: string }[];
+}
+
+/** Parse + shape-validate a { title, steps:[{text}] } ungrounded output (no citations). */
+export function parseUngroundedTitledSteps(raw: string): RawUngroundedTitledSteps {
+  const text = stripJsonFences(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`could not parse titled steps from model output: ${(err as Error).message}`);
+  }
+  const title = (parsed as { title?: unknown }).title;
+  const steps = (parsed as { steps?: unknown }).steps;
+  const stepsOk =
+    Array.isArray(steps) &&
+    steps.every(
+      (s) => typeof s === 'object' && s !== null && typeof (s as { text?: unknown }).text === 'string',
+    );
+  if (typeof title !== 'string' || title.trim() === '' || !stepsOk) {
+    throw new Error('could not parse titled steps from model output: shape mismatch');
+  }
+  return { title: title.trim(), steps: (steps as { text: string }[]).map((s) => ({ text: s.text })) };
+}
+
+interface RawTitledSteps {
+  title: string;
+  steps: RawSteps['steps'];
+}
+
+/** Parse + shape-validate a { title, steps } model output. Strips ``` fences like parseSteps. */
+export function parseTitledSteps(raw: string): RawTitledSteps {
+  const text = stripJsonFences(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`could not parse titled steps from model output: ${(err as Error).message}`);
+  }
+  const title = (parsed as { title?: unknown }).title;
+  if (typeof title !== 'string' || title.trim() === '' || !isRawSteps(parsed)) {
+    throw new Error('could not parse titled steps from model output: shape mismatch');
+  }
+  return { title: title.trim(), steps: (parsed as RawSteps).steps };
+}

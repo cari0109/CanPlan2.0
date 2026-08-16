@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "CanPlan 2.0",
+    "slug": "canplan-mobile-ui",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.canplan.mobileui"
+    },
+    "android": {
+      "package": "com.canplan.mobileui"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow CanPlan to access your photos for task and step images.",
+          "cameraPermission": "Allow CanPlan to use your camera for task and step images."
+        }
+      ],
+      "expo-audio",
+      "expo-video",
+      "expo-asset",
+      "expo-notifications",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "buildReactNativeFromSource": true
+          }
+        }
+      ],
+      "expo-fmt-consteval-fix"
+    ]
+  }
+}

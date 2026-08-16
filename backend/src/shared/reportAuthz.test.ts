@@ -1,0 +1,236 @@
+import { assertCanAccessUserReports, listAccessibleReportUserIds } from './reportAuthz';
+import { dynamo } from './dynamodb';
+import { UnauthorizedError, ValidationError } from './response';
+import type { AppSyncIdentity } from './types';
+
+jest.mock('./dynamodb', () => ({ dynamo: { send: jest.fn() }, TABLE_NAME: 'CanPlan-test' }));
+
+const mockSend = dynamo.send as jest.Mock;
+
+type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any -- loose mock helpers
+
+/**
+ * Mock DynamoDB by command + key so the REAL delegation rules (SupportPerson group, ACTIVE link,
+ * PRIMARY_USER target, shared org, matching membership snapshot) run against controlled data:
+ *  - profiles: by userId (#PROFILE GET)
+ *  - links: by `${supporterId}->${primaryUserId}` (SUPPORTER#/USER# GET)
+ */
+interface DbState {
+  profiles?: Record<string, Rec | undefined>;
+  links?: Record<string, Rec | undefined>;
+  linkRows?: Rec[];
+}
+let db: DbState = {};
+
+beforeEach(() => {
+  db = {};
+  mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+    const { input } = command;
+    if (command.constructor.name === 'GetCommand') {
+      const pk: string = input.Key.PK;
+      const sk: string = input.Key.SK;
+      if (sk === '#PROFILE') {
+        return Promise.resolve({ Item: db.profiles?.[pk.replace(/^USER#/, '')] });
+      }
+      if (sk.startsWith('USER#')) {
+        const supporterId = pk.replace(/^SUPPORTER#/, '');
+        const primaryUserId = sk.replace(/^USER#/, '');
+        return Promise.resolve({ Item: db.links?.[`${supporterId}->${primaryUserId}`] });
+      }
+    }
+    if (command.constructor.name === 'QueryCommand') {
+      return Promise.resolve({ Items: db.linkRows ?? [] });
+    }
+    if (command.constructor.name === 'BatchGetCommand') {
+      const keys = input.RequestItems['CanPlan-test'].Keys as Rec[];
+      return Promise.resolve({
+        Responses: {
+          'CanPlan-test': keys
+            .map((key) => db.profiles?.[String(key.PK).replace(/^USER#/, '')])
+            .filter(Boolean),
+        },
+      });
+    }
+    return Promise.resolve({});
+  });
+});
+afterEach(() => jest.clearAllMocks());
+
+/** A SupportPerson caller identity (Cognito group is the authorization source of truth). */
+const supporter: AppSyncIdentity = { sub: 'sup-1', groups: ['SupportPerson'] };
+
+/**
+ * Wire up the happy-path world: an ACTIVE link between a same-org SupportPerson and PrimaryUser
+ * whose selection snapshot (organization + both membership sessions) still matches both profiles
+ * — the only combination that grants delegated access.
+ */
+function grantHappyPath(): void {
+  db.profiles = {
+    'sup-1': {
+      userId: 'sup-1',
+      role: 'SUPPORT_PERSON',
+      organizationId: 'org-1',
+      organizationMembershipId: 'mid-sup',
+    },
+    'pu-1': {
+      userId: 'pu-1',
+      role: 'PRIMARY_USER',
+      organizationId: 'org-1',
+      organizationMembershipId: 'mid-pu',
+    },
+  };
+  db.links = {
+    'sup-1->pu-1': {
+      status: 'ACTIVE',
+      organizationId: 'org-1',
+      supporterOrganizationMembershipId: 'mid-sup',
+      primaryUserOrganizationMembershipId: 'mid-pu',
+    },
+  };
+}
+
+describe('assertCanAccessUserReports', () => {
+  it('allows a SupportPerson whose ACTIVE link matches both users current membership snapshot', async () => {
+    grantHappyPath();
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).resolves.toBe('sup-1');
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(assertCanAccessUserReports(undefined, 'pu-1')).rejects.toThrow(UnauthorizedError);
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty target userId', async () => {
+    await expect(assertCanAccessUserReports(supporter, '   ')).rejects.toThrow(ValidationError);
+  });
+
+  it('rejects a primary user accessing their OWN reports (self-access denied, no reads)', async () => {
+    const selfUser: AppSyncIdentity = { sub: 'pu-1', groups: ['PrimaryUser'] };
+    await expect(assertCanAccessUserReports(selfUser, 'pu-1')).rejects.toThrow(UnauthorizedError);
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-SupportPerson caller', async () => {
+    grantHappyPath();
+    const notSupport: AppSyncIdentity = { sub: 'sup-1', groups: ['PrimaryUser'] };
+    await expect(assertCanAccessUserReports(notSupport, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a SupportPerson without an ACTIVE link (revoked)', async () => {
+    grantHappyPath();
+    db.links = { 'sup-1->pu-1': { status: 'REVOKED' } };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a SupportPerson with no link at all', async () => {
+    grantHappyPath();
+    db.links = {};
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects when the target is not a PRIMARY_USER', async () => {
+    grantHappyPath();
+    db.profiles!['pu-1'] = { userId: 'pu-1', role: 'SUPPORT_PERSON', organizationId: 'org-1' };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects when the target profile no longer exists', async () => {
+    grantHappyPath();
+    delete db.profiles!['pu-1'];
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects an organization mismatch between supporter and target', async () => {
+    grantHappyPath();
+    db.profiles!['pu-1'] = { userId: 'pu-1', role: 'PRIMARY_USER', organizationId: 'org-2' };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a legacy ACTIVE link without a membership snapshot (fails closed until re-selected)', async () => {
+    grantHappyPath();
+    db.links = { 'sup-1->pu-1': { status: 'ACTIVE' } };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a link selected under an older membership session (e.g. the target left and rejoined the org)', async () => {
+    grantHappyPath();
+    db.profiles!['pu-1'] = {
+      ...db.profiles!['pu-1'],
+      organizationMembershipId: 'mid-pu-rejoined',
+    };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+});
+
+describe('listAccessibleReportUserIds', () => {
+  const activeLink = (primaryUserId: string, overrides: Rec = {}): Rec => ({
+    supporterId: 'sup-1',
+    primaryUserId,
+    userId: primaryUserId,
+    status: 'ACTIVE',
+    organizationId: 'org-1',
+    supporterOrganizationMembershipId: 'mid-sup',
+    primaryUserOrganizationMembershipId: `mid-${primaryUserId}`,
+    ...overrides,
+  });
+
+  const primaryProfile = (userId: string, overrides: Rec = {}): Rec => ({
+    userId,
+    role: 'PRIMARY_USER',
+    organizationId: 'org-1',
+    organizationMembershipId: `mid-${userId}`,
+    ...overrides,
+  });
+
+  it('returns sorted, de-duplicated ids for only currently effective links', async () => {
+    db.profiles = {
+      'sup-1': {
+        userId: 'sup-1',
+        role: 'SUPPORT_PERSON',
+        organizationId: 'org-1',
+        organizationMembershipId: 'mid-sup',
+      },
+      'pu-a': primaryProfile('pu-a'),
+      'pu-b': primaryProfile('pu-b'),
+      'pu-revoked': primaryProfile('pu-revoked'),
+      'pu-stale': primaryProfile('pu-stale', {
+        organizationMembershipId: 'new-membership',
+      }),
+      'not-primary': primaryProfile('not-primary', { role: 'SUPPORT_PERSON' }),
+    };
+    db.linkRows = [
+      activeLink('pu-b'),
+      activeLink('pu-revoked', { status: 'REVOKED' }),
+      activeLink('pu-a'),
+      activeLink('pu-stale'),
+      activeLink('not-primary'),
+      activeLink('pu-a'),
+    ];
+
+    await expect(listAccessibleReportUserIds(supporter)).resolves.toEqual(['pu-a', 'pu-b']);
+
+    const query = mockSend.mock.calls.find(
+      ([command]) => command.constructor.name === 'QueryCommand',
+    )?.[0].input;
+    expect(query).toMatchObject({
+      ConsistentRead: true,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+    });
+    expect(query.ExpressionAttributeValues[':pk']).toBe('SUPPORTER#sup-1');
+  });
+
+  it('returns an empty list when the caller has no profile or effective links', async () => {
+    db.profiles = {};
+    db.linkRows = [activeLink('pu-a')];
+    await expect(listAccessibleReportUserIds(supporter)).resolves.toEqual([]);
+    expect(
+      mockSend.mock.calls.some(([command]) => command.constructor.name === 'QueryCommand'),
+    ).toBe(false);
+  });
+
+  it('rejects a caller who is not in the SupportPerson Cognito group before reading', async () => {
+    const primary: AppSyncIdentity = { sub: 'pu-a', groups: ['PrimaryUser'] };
+    await expect(listAccessibleReportUserIds(primary)).rejects.toThrow(UnauthorizedError);
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+});
